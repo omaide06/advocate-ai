@@ -1,0 +1,40 @@
+# ============================================================
+# ADVOCATE Backend – Python Dependencies
+# ============================================================
+# Install with:  pip install -r requirements.txt
+# Python version: 3.11+
+# ============================================================
+
+# ── Web framework ────────────────────────────────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# ── ASGI / Server extras ─────────────────────────────────────
+# python-multipart required by FastAPI for form data (optional but good practice)
+python-multipart==0.0.17
+
+# ── Data validation ──────────────────────────────────────────
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# ── Database ─────────────────────────────────────────────────
+sqlalchemy==2.0.36
+aiosqlite==0.20.0        # Async SQLite driver
+greenlet==3.1.1          # Required by SQLAlchemy async engine (greenlet_spawn)
+
+# ── Environment / Config ─────────────────────────────────────
+python-dotenv==1.0.1
+
+# ── LLM providers (optional – install only what you need) ────
+# Uncomment the provider(s) you intend to use:
+# anthropic==0.40.0
+# openai==1.58.1
+
+# ── Typing extras ────────────────────────────────────────────
+# Included in stdlib for Python 3.11+ but listed for clarity
+# typing-extensions>=4.12.0   # already a transitive dependency of pydantic
+
+# ── Testing (optional) ───────────────────────────────────────
+# pytest==8.3.4
+# pytest-asyncio==0.24.0
+# httpx==0.28.1              # Required by TestClient for async FastAPI apps
