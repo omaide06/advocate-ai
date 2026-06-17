@@ -15,16 +15,16 @@ POST /analyze
 ┌─────────────────────────────────────────────────┐
 │                  Orchestrator                   │
 │                                                 │
-│  ①  Quality Assessor                           │
-│      → Score (1–5) + Attack Intensity          │
+│  ①  Quality Assessor                            │
+│      → Score (1–5) + Attack Intensity           │
 │                                                 │
-│  ②  Assumption Scanner  ──┐  (concurrent)      │
-│  ③  Steelman Generator  ──┘                    │
+│  ②  Assumption Scanner  ──┐  (concurrent)       │
+│  ③  Steelman Generator  ──┘                     │
 │                                                 │
-│  ④  Formatter                                  │
-│      → Verdict + Summary                       │
+│  ④  Formatter                                   │
+│      → Verdict + Summary                        │
 │                                                 │
-│  ⑤  Persist → SQLite                          │
+│  ⑤  Persist → SQLite                            │
 └─────────────────────────────────────────────────┘
       │
       ▼
@@ -339,7 +339,3 @@ All endpoints function identically in mock mode. The only difference is that `ll
 - **Concurrent agents**: Assumption Scanner and Steelman Generator run in parallel via `asyncio.gather` for ~2× throughput in standard mode.
 
 ---
-
-## License
-
-MIT © ADVOCATE Engineering
