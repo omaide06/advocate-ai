@@ -25,10 +25,12 @@ greenlet==3.1.1          # Required by SQLAlchemy async engine (greenlet_spawn)
 # ── Environment / Config ─────────────────────────────────────
 python-dotenv==1.0.1
 
-# ── LLM providers (optional – install only what you need) ────
-# Uncomment the provider(s) you intend to use:
-# anthropic==0.40.0
-# openai==1.58.1
+# ── LLM providers ────────────────────────────────────────────
+# All providers are now active. NVIDIA uses the openai SDK
+# pointed at a different base URL – no extra package needed.
+anthropic>=0.40.0
+openai>=1.58.1
+google-generativeai>=0.8.0
 
 # ── Typing extras ────────────────────────────────────────────
 # Included in stdlib for Python 3.11+ but listed for clarity

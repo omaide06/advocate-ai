@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.analyze import router as analyze_router
 from app.api.health import router as health_router
+from app.api.models_router import router as models_router
 from app.api.session import router as session_router
 from app.database.database import init_db
 from app.schemas.response import ErrorResponse
@@ -152,6 +153,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 app.include_router(health_router)
 app.include_router(analyze_router)
 app.include_router(session_router)
+app.include_router(models_router)
 
 
 # ===========================================================================

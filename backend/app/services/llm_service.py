@@ -3,18 +3,31 @@ services/llm_service.py
 -----------------------
 Unified LLM abstraction layer for the ADVOCATE backend.
 
-Priority resolution (first available wins):
-  1. Anthropic   – if ``ANTHROPIC_API_KEY`` is set in the environment.
-  2. OpenAI      – if ``OPENAI_API_KEY`` is set in the environment.
-  3. Mock        – deterministic, key-free fallback that returns realistic
-                   structured data so the entire system runs without any
-                   external API credentials.
+Supported providers
+-------------------
+  - Anthropic  (Claude)      – ``anthropic`` SDK, requires ANTHROPIC_API_KEY
+  - OpenAI     (ChatGPT)     – ``openai`` SDK, requires OPENAI_API_KEY
+  - Gemini     (Google)      – ``google-generativeai`` SDK, requires GOOGLE_API_KEY
+  - NVIDIA     (free models) – ``openai`` SDK pointed at NVIDIA's endpoint;
+                               free tier works with no key, higher throughput
+                               with a free NVIDIA_API_KEY from build.nvidia.com
+  - Mock                     – deterministic, key-free fallback for unit tests
+
+Default resolution order (first available wins, env keys only):
+  1. Anthropic   – if ANTHROPIC_API_KEY is set
+  2. OpenAI      – if OPENAI_API_KEY is set
+  3. Gemini      – if GOOGLE_API_KEY is set
+  4. NVIDIA      – always available (free tier, no key required) ← new default
+  5. Mock        – explicit override only (provider=mock in request)
+
+Per-request override
+---------------------
+  Agents remain provider-agnostic.  The orchestrator may call
+  ``create_provider(provider_id, api_key, model)`` to build a request-scoped
+  provider that overrides the singleton for that single analysis run.
 
 All providers expose the same async interface:
   ``async def complete(system: str, user: str) -> str``
-
-This means agents never need to know which backend is in use; they simply
-call ``llm_service.complete(...)`` and receive a string back.
 """
 
 import json
@@ -27,9 +40,49 @@ from app.utils.logger import get_logger
 
 log = get_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Provider IDs (string literals used in the request schema and catalog)
+# ---------------------------------------------------------------------------
+PROVIDER_ANTHROPIC = "anthropic"
+PROVIDER_OPENAI = "openai"
+PROVIDER_GEMINI = "gemini"
+PROVIDER_NVIDIA = "nvidia"
+PROVIDER_MOCK = "mock"
+
+# ---------------------------------------------------------------------------
+# Supported models catalog – also served by GET /models
+# ---------------------------------------------------------------------------
+MODELS_CATALOG: dict[str, list[dict]] = {
+    PROVIDER_ANTHROPIC: [
+        {"id": "claude-3-5-haiku-20241022",  "name": "Claude 3.5 Haiku",   "description": "Fast & efficient",       "default": True},
+        {"id": "claude-3-5-sonnet-20241022", "name": "Claude 3.5 Sonnet",  "description": "Balanced performance",   "default": False},
+        {"id": "claude-opus-4-5",            "name": "Claude Opus 4.5",    "description": "Most powerful Claude",   "default": False},
+    ],
+    PROVIDER_OPENAI: [
+        {"id": "gpt-4o-mini", "name": "GPT-4o Mini", "description": "Fast & cost-effective",  "default": True},
+        {"id": "gpt-4o",      "name": "GPT-4o",      "description": "Balanced performance",   "default": False},
+        {"id": "o3-mini",     "name": "o3-mini",     "description": "Advanced reasoning",     "default": False},
+    ],
+    PROVIDER_GEMINI: [
+        {"id": "gemini-2.0-flash",   "name": "Gemini 2.0 Flash",   "description": "Fast & efficient",     "default": True},
+        {"id": "gemini-2.5-pro",     "name": "Gemini 2.5 Pro",     "description": "Most powerful Gemini", "default": False},
+    ],
+    PROVIDER_NVIDIA: [
+        {"id": "meta/llama-3.1-70b-instruct",            "name": "Llama 3.1 70B",    "description": "Free – Meta's flagship open model",    "default": True},
+        {"id": "mistralai/mixtral-8x7b-instruct-v0.1",   "name": "Mixtral 8x7B",     "description": "Free – Mistral mixture-of-experts",    "default": False},
+        {"id": "microsoft/phi-3-medium-128k-instruct",   "name": "Phi-3 Medium",     "description": "Free – Microsoft small language model", "default": False},
+        {"id": "google/gemma-7b",                        "name": "Gemma 7B",         "description": "Free – Google open model",             "default": False},
+    ],
+    PROVIDER_MOCK: [
+        {"id": "mock",  "name": "Mock (test)", "description": "Deterministic offline responses", "default": True},
+    ],
+}
+
+_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+
 
 # ===========================================================================
-# Abstract base – every provider must implement this contract.
+# Abstract base
 # ===========================================================================
 
 
@@ -37,15 +90,14 @@ class BaseLLMProvider(ABC):
     """
     Abstract LLM provider interface.
 
-    Sub-classes wrap a specific API client (Anthropic, OpenAI, etc.) and
-    expose a single async ``complete`` method so agents remain provider-
-    agnostic.
+    Sub-classes wrap a specific API client and expose a single async
+    ``complete`` method so agents remain provider-agnostic.
     """
 
     @property
     @abstractmethod
     def name(self) -> str:
-        """Return a short identifier for this provider (used in logs/DB)."""
+        """Short identifier for this provider (used in logs / DB)."""
 
     @abstractmethod
     async def complete(self, system: str, user: str) -> str:
@@ -55,16 +107,15 @@ class BaseLLMProvider(ABC):
         Parameters
         ----------
         system:
-            The system-level instruction that sets the LLM's persona and
-            output format.
+            System-level instruction that sets the LLM's persona and output
+            format.
         user:
-            The user-turn prompt containing the idea and task description.
+            User-turn prompt containing the idea and task description.
 
         Returns
         -------
         str
-            Raw text response from the model.  Agents are responsible for
-            parsing this into structured data (typically JSON).
+            Raw text response from the model.  Agents parse this into JSON.
         """
 
 
@@ -77,36 +128,30 @@ class AnthropicProvider(BaseLLMProvider):
     """
     Anthropic Claude provider.
 
-    Uses the ``anthropic`` Python SDK (>=0.25).  The model defaults to
-    ``claude-3-5-haiku-20241022`` which offers a good balance of speed and
-    quality for structured-output tasks.  Override via the ``ANTHROPIC_MODEL``
-    environment variable.
+    Uses the ``anthropic`` Python SDK (>=0.25).  Defaults to
+    ``claude-3-5-haiku-20241022``; override via ``ANTHROPIC_MODEL`` env var
+    or pass ``model`` explicitly to the constructor.
     """
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, api_key: str, model: Optional[str] = None) -> None:
         try:
-            import anthropic  # lazy import – only needed when this provider is active
+            import anthropic  # lazy import
         except ImportError as exc:
             raise RuntimeError(
-                "The 'anthropic' package is required to use the Anthropic provider. "
-                "Install it with: pip install anthropic"
+                "The 'anthropic' package is required. Install: pip install anthropic"
             ) from exc
 
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
-        self._model: str = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022")
+        self._model: str = model or os.getenv(
+            "ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"
+        )
         log.info("AnthropicProvider initialised (model=%s)", self._model)
 
     @property
     def name(self) -> str:
-        return "anthropic"
+        return f"anthropic/{self._model}"
 
     async def complete(self, system: str, user: str) -> str:
-        """
-        Call the Anthropic Messages API with the given system / user pair.
-
-        We request up to 4 096 output tokens which is sufficient for the
-        longest ADVOCATE agent responses.
-        """
         message = await self._client.messages.create(
             model=self._model,
             max_tokens=4096,
@@ -118,38 +163,139 @@ class AnthropicProvider(BaseLLMProvider):
 
 class OpenAIProvider(BaseLLMProvider):
     """
-    OpenAI Chat Completion provider.
+    OpenAI Chat Completion provider (ChatGPT).
 
-    Uses the ``openai`` Python SDK (>=1.0).  Defaults to ``gpt-4o-mini``
-    which is fast and cost-effective for structured tasks.  Override via the
-    ``OPENAI_MODEL`` environment variable.
+    Uses the ``openai`` Python SDK (>=1.0).  Defaults to ``gpt-4o-mini``;
+    override via ``OPENAI_MODEL`` env var or pass ``model`` explicitly.
     """
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, api_key: str, model: Optional[str] = None) -> None:
         try:
             from openai import AsyncOpenAI  # lazy import
         except ImportError as exc:
             raise RuntimeError(
-                "The 'openai' package is required to use the OpenAI provider. "
-                "Install it with: pip install openai"
+                "The 'openai' package is required. Install: pip install openai"
             ) from exc
 
         self._client = AsyncOpenAI(api_key=api_key)
-        self._model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self._model: str = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         log.info("OpenAIProvider initialised (model=%s)", self._model)
 
     @property
     def name(self) -> str:
-        return "openai"
+        return f"openai/{self._model}"
+
+    async def complete(self, system: str, user: str) -> str:
+        response = await self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=4096,
+            temperature=0.7,
+        )
+        return response.choices[0].message.content or ""
+
+
+class GeminiProvider(BaseLLMProvider):
+    """
+    Google Gemini provider.
+
+    Uses the ``google-generativeai`` Python SDK (>=0.8).  Defaults to
+    ``gemini-2.0-flash``; override via ``GOOGLE_MODEL`` env var or pass
+    ``model`` explicitly.
+    """
+
+    def __init__(self, api_key: str, model: Optional[str] = None) -> None:
+        try:
+            import google.generativeai as genai  # lazy import
+        except ImportError as exc:
+            raise RuntimeError(
+                "The 'google-generativeai' package is required. "
+                "Install: pip install google-generativeai"
+            ) from exc
+
+        genai.configure(api_key=api_key)
+        self._model_id: str = model or os.getenv("GOOGLE_MODEL", "gemini-2.0-flash")
+        self._client = genai.GenerativeModel(self._model_id)
+        log.info("GeminiProvider initialised (model=%s)", self._model_id)
+
+    @property
+    def name(self) -> str:
+        return f"gemini/{self._model_id}"
 
     async def complete(self, system: str, user: str) -> str:
         """
-        Call the OpenAI Chat Completions endpoint.
-
-        JSON mode is NOT explicitly requested here because our system prompts
-        already instruct the model to output valid JSON and we need the
-        flexibility to parse streaming or plain-text responses from agents.
+        Gemini uses a combined system+user prompt because the SDK's
+        ``system_instruction`` param is simpler for our use-case than
+        multi-turn history.
         """
+        import asyncio
+
+        combined_prompt = f"{system}\n\n---\n\n{user}"
+        # google-generativeai's generate_content is sync; run in executor
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: self._client.generate_content(combined_prompt),
+        )
+        return response.text
+
+
+class NvidiaProvider(BaseLLMProvider):
+    """
+    NVIDIA-hosted free open-source models.
+
+    Powered by NVIDIA's OpenAI-compatible API endpoint at
+    ``https://integrate.api.nvidia.com/v1``.  No key is required for the
+    free tier (anonymous access), making this the **default fallback** when
+    no other API keys are configured.
+
+    For higher throughput, users can supply a free NVIDIA API key from
+    https://build.nvidia.com
+
+    Key resolution order:
+      1. ``api_key`` argument (user-supplied per-request)
+      2. ``NVIDIA_API_KEY`` environment variable
+      3. Empty string → NVIDIA anonymous free tier
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> None:
+        try:
+            from openai import AsyncOpenAI  # lazy import – reuses openai SDK
+        except ImportError as exc:
+            raise RuntimeError(
+                "The 'openai' package is required for the NVIDIA provider. "
+                "Install: pip install openai"
+            ) from exc
+
+        resolved_key: str = (
+            api_key
+            or os.getenv("NVIDIA_API_KEY", "")
+        )
+        self._client = AsyncOpenAI(
+            api_key=resolved_key or "no-key-required",  # SDK requires a non-empty string
+            base_url=_NVIDIA_BASE_URL,
+        )
+        self._model: str = model or os.getenv(
+            "NVIDIA_MODEL", "meta/llama-3.1-70b-instruct"
+        )
+        log.info(
+            "NvidiaProvider initialised (model=%s, key_provided=%s)",
+            self._model,
+            bool(resolved_key),
+        )
+
+    @property
+    def name(self) -> str:
+        return f"nvidia/{self._model}"
+
+    async def complete(self, system: str, user: str) -> str:
         response = await self._client.chat.completions.create(
             model=self._model,
             messages=[
@@ -166,20 +312,9 @@ class MockProvider(BaseLLMProvider):
     """
     Deterministic mock LLM provider.
 
-    Returns realistic, structurally correct JSON responses without making any
-    network requests.  This allows the entire ADVOCATE pipeline – including
-    the orchestrator, all agents, and the database – to be exercised with zero
-    API credentials.
-
-    The responses are templated with the idea text so they feel contextual
-    rather than completely static, even though no actual language model is
-    involved.
-
-    Agent-specific dispatch:
-    The mock provider inspects the ``system`` prompt for known agent keywords
-    (``quality_assessor``, ``assumption_scanner``, ``steelman``, ``formatter``)
-    and returns a matching mock structure.  Any unknown prompt falls back to a
-    generic quality-assessor response.
+    Returns realistic, structurally correct JSON responses without any
+    network requests.  Retained for explicit test use via ``provider=mock``.
+    No longer used as a production fallback (NVIDIA free tier fills that role).
     """
 
     @property
@@ -187,15 +322,7 @@ class MockProvider(BaseLLMProvider):
         return "mock"
 
     async def complete(self, system: str, user: str) -> str:
-        """
-        Return a structurally valid JSON string that matches the schema
-        expected by whichever agent is calling.
-
-        The method inspects ``system`` (lowercased) to determine context.
-        """
         system_lower = system.lower()
-
-        # Extract a short snippet of the idea for contextual flavour.
         idea_snippet = user[:80].strip().rstrip(".,;") if user else "this idea"
 
         if "quality_assessor" in system_lower or "score" in system_lower:
@@ -207,7 +334,6 @@ class MockProvider(BaseLLMProvider):
         elif "formatter" in system_lower or "verdict" in system_lower:
             return self._formatter_response(idea_snippet)
         else:
-            # Default fallback
             return self._quality_response(idea_snippet)
 
     # ------------------------------------------------------------------
@@ -215,7 +341,6 @@ class MockProvider(BaseLLMProvider):
     # ------------------------------------------------------------------
 
     def _quality_response(self, snippet: str) -> str:
-        """Return a mock quality-assessor JSON payload."""
         score = round(random.uniform(1.5, 4.5), 1)
         labels = {
             range(1, 3): ("Poor", "aggressive"),
@@ -241,7 +366,6 @@ class MockProvider(BaseLLMProvider):
         )
 
     def _assumption_response(self, snippet: str) -> str:
-        """Return a mock assumption-scanner JSON payload."""
         return json.dumps(
             {
                 "assumptions": [
@@ -287,7 +411,6 @@ class MockProvider(BaseLLMProvider):
         )
 
     def _steelman_response(self, snippet: str) -> str:
-        """Return a mock steelman-generator JSON payload."""
         return json.dumps(
             {
                 "counter_arguments": [
@@ -334,7 +457,6 @@ class MockProvider(BaseLLMProvider):
         )
 
     def _formatter_response(self, snippet: str) -> str:
-        """Return a mock formatter JSON payload."""
         return json.dumps(
             {
                 "verdict": (
@@ -359,41 +481,110 @@ class MockProvider(BaseLLMProvider):
 
 
 # ===========================================================================
-# Factory – resolves and instantiates the correct provider at startup.
+# Per-request provider factory
+# ===========================================================================
+
+
+def create_provider(
+    provider_id: str,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+) -> BaseLLMProvider:
+    """
+    Instantiate and return a provider for a single analysis request.
+
+    Parameters
+    ----------
+    provider_id:
+        One of ``anthropic``, ``openai``, ``gemini``, ``nvidia``, ``mock``.
+    api_key:
+        User-supplied API key for paid providers.  For ``nvidia``, falls back
+        to the ``NVIDIA_API_KEY`` env var, then to anonymous free tier.
+    model:
+        Specific model ID within the provider.  Uses the provider's default
+        if omitted.
+
+    Returns
+    -------
+    BaseLLMProvider
+        A freshly constructed provider instance.
+
+    Raises
+    ------
+    ValueError
+        If ``provider_id`` is not recognised.
+    """
+    if provider_id == PROVIDER_ANTHROPIC:
+        if not api_key:
+            raise ValueError(
+                "An Anthropic API key is required. Provide 'api_key' in the request body."
+            )
+        return AnthropicProvider(api_key=api_key, model=model)
+
+    if provider_id == PROVIDER_OPENAI:
+        if not api_key:
+            raise ValueError(
+                "An OpenAI API key is required. Provide 'api_key' in the request body."
+            )
+        return OpenAIProvider(api_key=api_key, model=model)
+
+    if provider_id == PROVIDER_GEMINI:
+        if not api_key:
+            raise ValueError(
+                "A Google API key is required for Gemini. Provide 'api_key' in the request body."
+            )
+        return GeminiProvider(api_key=api_key, model=model)
+
+    if provider_id == PROVIDER_NVIDIA:
+        return NvidiaProvider(api_key=api_key, model=model)
+
+    if provider_id == PROVIDER_MOCK:
+        return MockProvider()
+
+    raise ValueError(
+        f"Unknown provider '{provider_id}'. "
+        f"Valid options: {', '.join([PROVIDER_ANTHROPIC, PROVIDER_OPENAI, PROVIDER_GEMINI, PROVIDER_NVIDIA, PROVIDER_MOCK])}"
+    )
+
+
+# ===========================================================================
+# LLMService – wraps a provider; used as the module-level singleton AND as
+# a per-request wrapper when the orchestrator creates a scoped provider.
 # ===========================================================================
 
 
 class LLMService:
     """
-    Singleton-style LLM service that wraps a :class:`BaseLLMProvider`.
+    LLM service that wraps a :class:`BaseLLMProvider`.
 
-    Call :meth:`get_provider_name` to find out which backend is active.
-    Agents call :meth:`complete` directly; they never interact with the
-    underlying provider.
-
-    Resolution order
-    ----------------
+    Default singleton resolution order (env keys):
+    -----------------------------------------------
     1. ``ANTHROPIC_API_KEY`` → :class:`AnthropicProvider`
     2. ``OPENAI_API_KEY``    → :class:`OpenAIProvider`
-    3. (no keys)             → :class:`MockProvider`
+    3. ``GOOGLE_API_KEY``    → :class:`GeminiProvider`
+    4. (none)                → :class:`NvidiaProvider` (free tier, always available)
+
+    For per-request overrides, the orchestrator calls ``LLMService(provider)``
+    with a freshly built provider from :func:`create_provider`.
     """
 
-    def __init__(self) -> None:
-        self._provider: BaseLLMProvider = self._resolve_provider()
+    def __init__(self, provider: Optional[BaseLLMProvider] = None) -> None:
+        self._provider: BaseLLMProvider = provider or self._resolve_provider()
         log.info("LLMService active provider: %s", self._provider.name)
 
     # ------------------------------------------------------------------
-    # Provider resolution
+    # Environment-based provider resolution (startup singleton)
     # ------------------------------------------------------------------
 
     @staticmethod
     def _resolve_provider() -> BaseLLMProvider:
         """
-        Inspect the environment for API keys and return the highest-priority
-        available provider.
+        Inspect environment variables and return the highest-priority
+        available provider.  NVIDIA free tier is always the last resort.
         """
         anthropic_key: Optional[str] = os.getenv("ANTHROPIC_API_KEY")
         openai_key: Optional[str] = os.getenv("OPENAI_API_KEY")
+        google_key: Optional[str] = os.getenv("GOOGLE_API_KEY")
 
         if anthropic_key and anthropic_key.strip():
             log.info("Anthropic API key detected – using AnthropicProvider.")
@@ -403,11 +594,16 @@ class LLMService:
             log.info("OpenAI API key detected – using OpenAIProvider.")
             return OpenAIProvider(api_key=openai_key.strip())
 
-        log.warning(
-            "No LLM API keys found. Falling back to MockProvider. "
-            "Set ANTHROPIC_API_KEY or OPENAI_API_KEY for live responses."
+        if google_key and google_key.strip():
+            log.info("Google API key detected – using GeminiProvider.")
+            return GeminiProvider(api_key=google_key.strip())
+
+        log.info(
+            "No paid LLM API keys found. Using NvidiaProvider (free tier) as default. "
+            "Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY for a specific provider, "
+            "or NVIDIA_API_KEY for higher NVIDIA throughput."
         )
-        return MockProvider()
+        return NvidiaProvider()
 
     # ------------------------------------------------------------------
     # Public interface
@@ -416,18 +612,6 @@ class LLMService:
     async def complete(self, system: str, user: str) -> str:
         """
         Proxy a completion request to the active provider.
-
-        Parameters
-        ----------
-        system:
-            The system-level instruction string.
-        user:
-            The user-turn prompt.
-
-        Returns
-        -------
-        str
-            Raw model response text.
 
         Raises
         ------
@@ -448,6 +632,8 @@ class LLMService:
 
 
 # ---------------------------------------------------------------------------
-# Module-level singleton – import and use ``llm_service`` directly.
+# Module-level singleton – resolved from environment variables at startup.
+# Import and use ``llm_service`` directly in agents/orchestrator unless a
+# per-request override is needed.
 # ---------------------------------------------------------------------------
 llm_service = LLMService()

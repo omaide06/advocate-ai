@@ -41,9 +41,13 @@ POST /analyze
 
 ### LLM Provider Resolution
 
-1. `ANTHROPIC_API_KEY` set → **Claude** (Anthropic)
-2. `OPENAI_API_KEY` set → **GPT-4o-mini** (OpenAI)
-3. No keys → **MockProvider** (deterministic, realistic fallback)
+Providers can be specified dynamically per-request, or resolved via environment variables:
+
+1. Per-request `provider` and `api_key` → **Selected Provider** (Anthropic, OpenAI, Gemini, NVIDIA, or Mock)
+2. `ANTHROPIC_API_KEY` set → **Claude** (Anthropic)
+3. `OPENAI_API_KEY` set → **ChatGPT** (OpenAI)
+4. `GEMINI_API_KEY` set → **Gemini** (Google)
+5. No keys → **NVIDIA Free Hosted Models** (defaulting to `meta/llama-3.1-70b-instruct`)
 
 ---
 
@@ -152,9 +156,14 @@ Run the full multi-agent analysis on an idea.
 {
   "idea": "We should replace all public schools with privately-run charter schools.",
   "mode": "standard",
-  "context": "Discussing US education policy reform."
+  "context": "Discussing US education policy reform.",
+  "provider": "anthropic",
+  "model": "claude-3-5-sonnet-20241022",
+  "api_key": "sk-ant-..."
 }
 ```
+
+> **Note**: `provider`, `model`, and `api_key` are optional. If an `api_key` is provided in the request, it is used only for the duration of the request and is never stored. If omitted, the system falls back to environment variables or free NVIDIA models.
 
 **Modes:**
 
@@ -163,6 +172,12 @@ Run the full multi-agent analysis on an idea.
 | `standard` | Full pipeline: score → assumptions + counter-args (concurrent) → verdict |
 | `quick`    | Score + assumptions only. No steelmanning, no formatter.           |
 | `deep`     | Double steelman pass (exploiting assumptions), aggressive assumption scan. |
+
+---
+
+### `GET /models`
+
+List all available LLM providers and their supported models. Useful for populating frontend dropdowns.
 
 ---
 
@@ -304,6 +319,9 @@ curl http://127.0.0.1:8000/session/YOUR-UUID-HERE
 | `ANTHROPIC_MODEL`   | `claude-3-5-haiku-20241022`                | Claude model to use.                     |
 | `OPENAI_API_KEY`    | –                                          | OpenAI API key (optional).               |
 | `OPENAI_MODEL`      | `gpt-4o-mini`                              | OpenAI model to use.                     |
+| `GEMINI_API_KEY`    | –                                          | Google Gemini API key (optional).        |
+| `GEMINI_MODEL`      | `gemini-2.0-flash`                         | Gemini model to use.                     |
+| `NVIDIA_API_KEY`    | –                                          | NVIDIA API key for higher throughput (optional). |
 | `DATABASE_URL`      | `sqlite+aiosqlite:///./advocate.db`        | SQLAlchemy async database URL.           |
 | `LOG_LEVEL`         | `INFO`                                     | Logging verbosity (DEBUG/INFO/WARNING).  |
 | `SQL_ECHO`          | `false`                                    | Echo SQL to stdout when `true`.          |
@@ -311,22 +329,16 @@ curl http://127.0.0.1:8000/session/YOUR-UUID-HERE
 
 ---
 
-## Running Without API Keys (Mock Mode)
+## Running Without API Keys (Free NVIDIA Models)
 
-The system detects the absence of API keys and automatically uses the built-in `MockProvider`, which returns realistic, structured analysis data. **No configuration is required to run in mock mode.**
+The system detects the absence of API keys and automatically uses free hosted models provided by NVIDIA (defaulting to `meta/llama-3.1-70b-instruct`). **No configuration is required to run in this mode.**
 
 ```bash
 # No .env needed – just run:
 uvicorn app.main:app --reload
 ```
 
-You will see this in the logs:
-
-```
-WARNING  advocate.services.llm_service  No LLM API keys found. Falling back to MockProvider.
-```
-
-All endpoints function identically in mock mode. The only difference is that `llm_provider` in responses will be `"mock"`.
+All endpoints function identically without keys. You can also explicitly request the built-in MockProvider by passing `"provider": "mock"` in your request body for deterministic, local testing.
 
 ---
 

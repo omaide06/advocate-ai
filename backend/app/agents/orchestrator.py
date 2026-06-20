@@ -46,7 +46,7 @@ from app.agents.quality_assessor import QualityAssessorAgent, QualityResult
 from app.agents.steelman_generator import CounterArgumentResult, SteelmanGeneratorAgent
 from app.models.session import AnalysisSession
 from app.schemas.request import AnalysisMode
-from app.services.llm_service import LLMService, llm_service
+from app.services.llm_service import LLMService, create_provider, llm_service
 from app.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -82,6 +82,9 @@ class AnalysisOrchestrator:
         mode: AnalysisMode,
         context: Optional[str],
         db: AsyncSession,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
     ) -> dict:
         """
         Execute the full ADVOCATE multi-agent analysis pipeline.
@@ -98,6 +101,16 @@ class AnalysisOrchestrator:
             An open ``AsyncSession`` from FastAPI's dependency injection.
             The orchestrator adds the new ``AnalysisSession`` record and the
             caller's dependency commits the transaction on clean exit.
+        provider:
+            Optional provider ID override for this request
+            (``anthropic`` | ``openai`` | ``gemini`` | ``nvidia`` | ``mock``).
+            If ``None``, the singleton ``llm_service`` is used (env-key priority).
+        model:
+            Specific model ID within the chosen provider.  Provider default
+            is used if ``None``.
+        api_key:
+            User-supplied API key.  Required for paid providers; ignored for
+            ``nvidia`` (falls back to env var / anonymous) and ``mock``.
 
         Returns
         -------
@@ -107,25 +120,52 @@ class AnalysisOrchestrator:
 
         Raises
         ------
+        ValueError
+            If ``provider`` is unrecognised or a required ``api_key`` is missing.
         RuntimeError
             If a critical agent fails in a way that cannot be recovered.
         """
         session_id = str(uuid.uuid4())
         start_time = time.monotonic()
 
+        # ---------------------------------------------------------------
+        # Resolve LLM service: per-request override OR module singleton.
+        # ---------------------------------------------------------------
+        if provider is not None:
+            request_provider = create_provider(
+                provider_id=provider,
+                api_key=api_key,
+                model=model,
+            )
+            active_llm = LLMService(provider=request_provider)
+        else:
+            active_llm = self._llm
+
+        # Rebuild agents with the resolved LLM for this request.
+        from app.agents.assumption_scanner import AssumptionScannerAgent
+        from app.agents.formatter import FormatterAgent
+        from app.agents.quality_assessor import QualityAssessorAgent
+        from app.agents.steelman_generator import SteelmanGeneratorAgent
+
+        quality_assessor = QualityAssessorAgent(llm=active_llm)
+        assumption_scanner = AssumptionScannerAgent(llm=active_llm)
+        steelman_generator = SteelmanGeneratorAgent(llm=active_llm)
+        formatter = FormatterAgent(llm=active_llm)
+
         log.info(
-            "Orchestrator: starting analysis session=%s mode=%s idea_len=%d",
+            "Orchestrator: starting analysis session=%s mode=%s provider=%s idea_len=%d",
             session_id,
             mode.value,
+            active_llm.get_provider_name(),
             len(idea),
         )
 
         # ---------------------------------------------------------------
         # STEP 1 – Quality Assessment
-        # Always runs first. Its score determines attack_intensity which
+        # Always runs first.  Its score determines attack_intensity which
         # every subsequent agent needs.
         # ---------------------------------------------------------------
-        quality: QualityResult = await self._quality_assessor.assess(
+        quality: QualityResult = await quality_assessor.assess(
             idea=idea, context=context
         )
         log.debug(
@@ -147,7 +187,7 @@ class AnalysisOrchestrator:
         if mode == AnalysisMode.quick:
             # QUICK mode: run assumption scanner only, skip steelmanning.
             log.debug("Orchestrator: quick mode – skipping steelman generator.")
-            assumptions: list[AssumptionResult] = await self._assumption_scanner.scan(
+            assumptions: list[AssumptionResult] = await assumption_scanner.scan(
                 idea=idea,
                 attack_intensity=scan_intensity,
                 context=context,
@@ -172,13 +212,13 @@ class AnalysisOrchestrator:
                 "Orchestrator: running assumption scanner + steelman concurrently."
             )
             assumptions, counter_arguments = await asyncio.gather(
-                self._assumption_scanner.scan(
+                assumption_scanner.scan(
                     idea=idea,
                     attack_intensity=scan_intensity,
                     context=context,
                     quality_reasoning=quality.reasoning,
                 ),
-                self._steelman_generator.generate(
+                steelman_generator.generate(
                     idea=idea,
                     attack_intensity=quality.attack_intensity,
                     assumptions=[],  # First pass without assumptions for speed;
@@ -191,7 +231,7 @@ class AnalysisOrchestrator:
             # assumptions discovered in the first concurrent pass.
             if mode == AnalysisMode.deep:
                 log.debug("Orchestrator: deep mode – running second steelman pass.")
-                deep_counter_args = await self._steelman_generator.generate(
+                deep_counter_args = await steelman_generator.generate(
                     idea=idea,
                     attack_intensity="aggressive",  # deep mode is always aggressive
                     assumptions=assumptions,
@@ -205,7 +245,7 @@ class AnalysisOrchestrator:
                         seen.add(ca.argument)
 
             # STEP 3 – Final Formatter (synthesis)
-            formatter_result = await self._formatter.format(
+            formatter_result = await formatter.format(
                 idea=idea,
                 score=quality.score,
                 quality_label=quality.quality_label,
@@ -239,7 +279,7 @@ class AnalysisOrchestrator:
             for ca in counter_arguments
         ]
 
-        provider_name = self._llm.get_provider_name()
+        provider_name = active_llm.get_provider_name()
 
         # ---------------------------------------------------------------
         # DATABASE INTERACTION:
@@ -271,6 +311,9 @@ class AnalysisOrchestrator:
             elapsed,
             provider_name,
         )
+
+        # Note: api_key is intentionally NOT included in the returned dict
+        # or stored in the database.
 
         # Return a flat dict that maps 1:1 with AnalysisResponse schema.
         return {

@@ -6,6 +6,7 @@ POST /analyze endpoint – the primary entry point for the ADVOCATE pipeline.
 This module wires together:
 - Request validation (delegated to Pydantic via FastAPI).
 - The multi-agent orchestrator that runs the full analysis pipeline.
+- Per-request LLM provider selection (provider / model / api_key fields).
 - Response serialisation back to the caller.
 
 Error handling strategy:
@@ -71,10 +72,20 @@ async def analyze_idea(
         ``deep`` (extra assumption passes + double steelman).
     payload.context:
         Optional background information for the agents to consider.
+    payload.provider:
+        LLM provider override for this request (anthropic | openai | gemini |
+        nvidia | mock).  Falls back to server env-key resolution if omitted.
+    payload.model:
+        Specific model ID within the chosen provider.  Uses provider default
+        if omitted.
+    payload.api_key:
+        User-supplied API key for paid providers.  Never stored or logged.
     """
     log.info(
-        "POST /analyze – mode=%s idea_len=%d",
+        "POST /analyze – mode=%s provider=%s model=%s idea_len=%d",
         payload.mode.value,
+        payload.provider.value if payload.provider else "server-default",
+        payload.model or "provider-default",
         len(payload.idea),
     )
 
@@ -84,7 +95,17 @@ async def analyze_idea(
             mode=payload.mode,
             context=payload.context,
             db=db,
+            provider=payload.provider.value if payload.provider else None,
+            model=payload.model,
+            api_key=payload.api_key,
         )
+    except ValueError as exc:
+        # Invalid provider / missing key – return 400
+        log.warning("Bad request: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
     except RuntimeError as exc:
         log.error("Pipeline runtime error: %s", exc)
         raise HTTPException(
